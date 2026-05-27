@@ -57,7 +57,9 @@ class ArcGISChatClient:
                 "content": (
                     "You are the answering layer for a Graphiti-powered RAG system. "
                     "Use the retrieved graph context first, then use recent chat history for continuity. "
-                    "If the graph context is empty or insufficient, say so plainly instead of inventing facts."
+                    "Treat FACTS and ENTITIES as summaries, and treat EPISODES and SOURCE_EXCERPTS as the original grounding text. "
+                    "When the original grounding text supports a short, well-grounded inference across sentences or excerpts, make that inference explicitly instead of claiming the answer is missing. "
+                    "If the graph context is empty or insufficient even after checking the original grounding text, say so plainly instead of inventing facts."
                 ),
             },
             {

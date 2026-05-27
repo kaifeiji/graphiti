@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from graphiti_core import Graphiti
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
@@ -31,6 +33,62 @@ from app.services.arcgis_runtime import (
     close_arcgis_async_http_clients,
     create_async_arcgis_openai_client,
 )
+
+
+MAX_FACT_SOURCE_EPISODES = 4
+MAX_DIRECT_SOURCE_EPISODES = 2
+MAX_FACT_SOURCE_EDGES = 8
+MAX_CONTEXT_FACTS = 8
+MAX_CONTEXT_ENTITIES = 8
+MAX_CONTEXT_EPISODES = 4
+MAX_SOURCE_EXCERPT_CHARS = 3200
+MAX_SOURCE_EXCERPT_LENGTH = 900
+SOURCE_EXCERPT_QUERY_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "at",
+    "before",
+    "both",
+    "by",
+    "did",
+    "do",
+    "does",
+    "first",
+    "for",
+    "from",
+    "how",
+    "in",
+    "is",
+    "last",
+    "later",
+    "name",
+    "of",
+    "on",
+    "or",
+    "other",
+    "same",
+    "than",
+    "that",
+    "the",
+    "their",
+    "then",
+    "these",
+    "this",
+    "those",
+    "to",
+    "was",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+    "year",
+}
 
 
 @dataclass(slots=True)
@@ -172,7 +230,11 @@ class GraphitiRAGService:
 
         items: list[ContextItem] = self._build_context_items(results)
         context_text: str = (
-            search_results_to_context_string(results)
+            await self._build_context_text(
+                query,
+                results,
+                requested_group_id or self._settings.graph_group_id,
+            )
             if items
             else "No relevant graph context was found in the local Graphiti store."
         )
@@ -400,6 +462,169 @@ class GraphitiRAGService:
             )
 
         return [item for item in items if item.content][: self._settings.search_limit]
+
+    async def _build_context_text(self, query: str, results: object, group_id: str) -> str:
+        """Render Graphiti results plus supporting source excerpts for fact grounding."""
+
+        base_context_results = self._slice_results_for_context(results)
+        base_context: str = search_results_to_context_string(base_context_results)
+        supporting_excerpts = await self._collect_fact_source_excerpts(query, results, group_id)
+        if not supporting_excerpts:
+            return base_context
+
+        return (
+            f"{base_context}\n\n"
+            "Use the EPISODES section above as the original text for directly retrieved episodes. "
+            "The following source excerpts are the original episode texts that support retrieved facts.\n"
+            "<SOURCE_EXCERPTS>\n"
+            f"{supporting_excerpts}\n"
+            "</SOURCE_EXCERPTS>"
+        )
+
+    def _slice_results_for_context(self, results: object) -> object:
+        """Reduce LLM context noise by trimming each Graphiti result bucket to its top items."""
+
+        return SimpleNamespace(
+            edges=list(getattr(results, "edges", []))[:MAX_CONTEXT_FACTS],
+            nodes=list(getattr(results, "nodes", []))[:MAX_CONTEXT_ENTITIES],
+            episodes=list(getattr(results, "episodes", []))[:MAX_CONTEXT_EPISODES],
+            communities=list(getattr(results, "communities", [])),
+        )
+
+    async def _collect_fact_source_excerpts(self, query: str, results: object, group_id: str) -> str:
+        """Attach original episode text for fact results that expose episode provenance."""
+
+        direct_episode_uuids: set[str] = set()
+        for episode in getattr(results, "episodes", [])[:MAX_DIRECT_SOURCE_EPISODES]:
+            episode_uuid = str(getattr(episode, "uuid", "")).strip()
+            if not episode_uuid:
+                continue
+            direct_episode_uuids.add(episode_uuid)
+
+        query_terms = self._extract_source_excerpt_query_terms(query)
+        supporting_facts_by_episode_uuid: dict[str, list[str]] = {}
+        supporting_episode_scores: dict[str, tuple[int, int, int]] = {}
+
+        for edge_rank, edge in enumerate(getattr(results, "edges", [])[:MAX_FACT_SOURCE_EDGES], start=1):
+            fact_text = str(getattr(edge, "fact", "")).strip()
+            episode_uuids = [
+                str(episode_uuid).strip()
+                for episode_uuid in getattr(edge, "episodes", []) or []
+                if str(episode_uuid).strip()
+            ]
+            if not fact_text or not episode_uuids:
+                continue
+
+            overlap_count = 0
+            if query_terms:
+                overlap_count = len(query_terms & self._extract_source_excerpt_query_terms(fact_text))
+
+            for episode_uuid in episode_uuids:
+                if episode_uuid in direct_episode_uuids:
+                    continue
+                supporting_facts_by_episode_uuid.setdefault(episode_uuid, []).append(fact_text)
+                previous_overlap_count, previous_fact_count, previous_best_rank = supporting_episode_scores.get(
+                    episode_uuid,
+                    (0, 0, edge_rank),
+                )
+                supporting_episode_scores[episode_uuid] = (
+                    previous_overlap_count + overlap_count,
+                    previous_fact_count + 1,
+                    min(previous_best_rank, edge_rank),
+                )
+
+        if not supporting_facts_by_episode_uuid:
+            return ""
+
+        ranked_episode_uuids = sorted(
+            supporting_facts_by_episode_uuid,
+            key=lambda episode_uuid: (
+                -supporting_episode_scores[episode_uuid][0],
+                -supporting_episode_scores[episode_uuid][1],
+                supporting_episode_scores[episode_uuid][2],
+            ),
+        )[:MAX_FACT_SOURCE_EPISODES]
+
+        supporting_episodes = await self._load_episodes_by_uuid(
+            ranked_episode_uuids,
+            group_id,
+        )
+
+        rendered_excerpts: list[str] = []
+        used_chars = 0
+        for episode_uuid in ranked_episode_uuids:
+            facts = supporting_facts_by_episode_uuid[episode_uuid]
+            episode = supporting_episodes.get(episode_uuid)
+            if not episode:
+                continue
+
+            fact_summary = "; ".join(dict.fromkeys(facts[:2]))
+            excerpt = self._truncate_source_excerpt(episode["content"])
+            rendered = "\n".join(
+                [
+                    f"- source_description: {episode['source_description']}",
+                    f"  supports_fact: {fact_summary}",
+                    f"  text: {excerpt}",
+                ]
+            )
+            projected_chars = used_chars + len(rendered)
+            if rendered_excerpts and projected_chars > MAX_SOURCE_EXCERPT_CHARS:
+                break
+            rendered_excerpts.append(rendered)
+            used_chars = projected_chars
+
+        return "\n\n".join(rendered_excerpts)
+
+    async def _load_episodes_by_uuid(
+        self,
+        episode_uuids: list[str],
+        group_id: str,
+    ) -> dict[str, dict[str, str]]:
+        """Load episode source text for a bounded set of episode uuids."""
+
+        unique_episode_uuids = list(dict.fromkeys(episode_uuids))
+        if not unique_episode_uuids:
+            return {}
+
+        graphiti: Graphiti = self._require_graphiti()
+        result = await graphiti.driver.execute_query(
+            """
+            MATCH (episode:Episodic {group_id: $group_id})
+            WHERE episode.uuid IN $episode_uuids
+            RETURN episode.uuid AS uuid,
+                   episode.source_description AS source_description,
+                   episode.content AS content
+            """,
+            params={
+                "group_id": group_id,
+                "episode_uuids": unique_episode_uuids,
+            },
+        )
+        return {
+            str(record["uuid"]): {
+                "source_description": str(record["source_description"] or "Episode"),
+                "content": str(record["content"] or "").strip(),
+            }
+            for record in result.records
+            if record.get("uuid") and str(record.get("content") or "").strip()
+        }
+
+    def _truncate_source_excerpt(self, content: str) -> str:
+        """Trim long source excerpts so grounding stays within a predictable token budget."""
+
+        normalized_content = content.strip()
+        if len(normalized_content) <= MAX_SOURCE_EXCERPT_LENGTH:
+            return normalized_content
+        return f"{normalized_content[: MAX_SOURCE_EXCERPT_LENGTH - 3].rstrip()}..."
+
+    def _extract_source_excerpt_query_terms(self, text: str) -> set[str]:
+        """Extract stable query terms so excerpt budget is spent on query-relevant facts."""
+
+        return {
+            token
+            for token in re.findall(r"[a-z0-9]+", text.lower())
+            if len(token) >= 3 and token not in SOURCE_EXCERPT_QUERY_STOPWORDS
+        }
 
 
 __all__ = ["GraphitiRAGService", "RetrievedContext"]
