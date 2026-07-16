@@ -62,6 +62,12 @@ class ArcGISOpenAIGenericClient(OpenAIGenericClient):
                 response_format=response_format,  # type: ignore[arg-type]
             )
             result = response.choices[0].message.content or ""
+            finish_reason = getattr(response.choices[0], "finish_reason", None)
+            if finish_reason == "length":
+                raise ValueError(
+                    "Structured JSON output was truncated because max_completion_tokens was reached. "
+                    f"Increase the completion token limit above {max_tokens}."
+                )
             return json.loads(result)
         except openai.RateLimitError as error:
             raise RateLimitError from error

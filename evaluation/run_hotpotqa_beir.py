@@ -9,6 +9,7 @@ import random
 import shutil
 import ssl
 import sys
+import time
 import urllib.request
 import zipfile
 from collections import defaultdict
@@ -23,6 +24,7 @@ if str(REPO_ROOT) not in sys.path:
 import certifi
 from beir.datasets.data_loader import GenericDataLoader
 from beir.retrieval.evaluation import EvaluateRetrieval
+from graphiti_core.llm_client.errors import RateLimitError
 from graphiti_core.search.search_config_recipes import COMBINED_HYBRID_SEARCH_RRF
 
 from app.config import Settings
@@ -32,6 +34,8 @@ from app.services.graphiti_service import GraphitiRAGService
 DATASET_URL = "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/hotpotqa.zip"
 DATASET_NAME = "hotpotqa"
 DOC_PREFIX = "beir-hotpotqa::"
+INGEST_MAX_RATE_LIMIT_RETRIES = 8
+INGEST_RATE_LIMIT_BACKOFF_SECONDS = 5.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,6 +73,22 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=5,
         help="Number of documents to ingest per Graphiti bulk batch. Default: 5",
+    )
+    parser.add_argument(
+        "--max-completion-tokens",
+        type=int,
+        default=4000,
+        help="Max completion tokens used by Graphiti LLM calls during evaluation. Default: 4000",
+    )
+    parser.add_argument(
+        "--evaluate-existing-only",
+        action="store_true",
+        help="Skip ingest and evaluate only the documents already present in the target Graphiti group.",
+    )
+    parser.add_argument(
+        "--existing-group-id",
+        default=None,
+        help="Existing Graphiti group id to evaluate against. Useful with --evaluate-existing-only.",
     )
     return parser.parse_args()
 
@@ -277,10 +297,65 @@ def build_subset_dataset(
     return corpus, queries, qrels, metadata
 
 
-def make_eval_settings(runtime_dir: Path, search_limit: int, reuse_index: bool) -> Settings:
+def filter_dataset_to_existing_docs(
+    corpus: dict[str, dict[str, str]],
+    queries: dict[str, str],
+    qrels: dict[str, dict[str, int]],
+    existing_doc_ids: set[str],
+) -> tuple[dict[str, dict[str, str]], dict[str, str], dict[str, dict[str, int]], dict[str, int]]:
+    filtered_corpus = {
+        doc_id: document
+        for doc_id, document in corpus.items()
+        if doc_id in existing_doc_ids
+    }
+    filtered_qrels: dict[str, dict[str, int]] = {}
+    partially_covered_query_count = 0
+    for query_id, labels in qrels.items():
+        positive_labels = {
+            corpus_id: score
+            for corpus_id, score in labels.items()
+            if score > 0
+        }
+        matching_labels = {
+            corpus_id: score
+            for corpus_id, score in positive_labels.items()
+            if corpus_id in existing_doc_ids
+        }
+        if not positive_labels:
+            continue
+        if len(matching_labels) == len(positive_labels):
+            filtered_qrels[query_id] = matching_labels
+        elif matching_labels:
+            partially_covered_query_count += 1
+
+    filtered_queries = {
+        query_id: query_text
+        for query_id, query_text in queries.items()
+        if query_id in filtered_qrels
+    }
+    stats = {
+        "existing_doc_count": len(filtered_corpus),
+        "retained_query_count": len(filtered_queries),
+        "dropped_query_count": max(len(queries) - len(filtered_queries), 0),
+        "partial_query_count": partially_covered_query_count,
+    }
+    return filtered_corpus, filtered_queries, filtered_qrels, stats
+
+
+def make_eval_settings(
+    runtime_dir: Path,
+    search_limit: int,
+    reuse_index: bool,
+    max_completion_tokens: int,
+    graph_group_id: str | None,
+) -> Settings:
     runtime_storage = runtime_dir / "storage"
     settings = Settings.from_env(project_root=REPO_ROOT)
-    group_id = f"{DATASET_NAME}-eval" if reuse_index else f"{DATASET_NAME}-eval-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+    group_id = graph_group_id or (
+        f"{DATASET_NAME}-eval"
+        if reuse_index
+        else f"{DATASET_NAME}-eval-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+    )
     return settings.model_copy(
         update={
             "storage_dir": runtime_storage,
@@ -288,6 +363,7 @@ def make_eval_settings(runtime_dir: Path, search_limit: int, reuse_index: bool) 
             "graph_group_id": group_id,
             "chunk_size": 100000,
             "search_limit": search_limit,
+            "max_completion_tokens": max_completion_tokens,
         }
     )
 
@@ -321,6 +397,15 @@ async def fetch_existing_doc_ids(service: GraphitiRAGService) -> set[str]:
     }
 
 
+def format_elapsed(seconds: float) -> str:
+    rounded_seconds = max(0, int(seconds))
+    hours, remainder = divmod(rounded_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
 async def ingest_subset(
     service: GraphitiRAGService,
     corpus: dict[str, dict[str, str]],
@@ -331,44 +416,89 @@ async def ingest_subset(
     known_existing_doc_ids = existing_doc_ids or set()
     total_docs = len(corpus)
     skipped_docs = 0
-    ingested_docs = 0
     pending_documents: list[tuple[str, str, str]] = []
-    pending_count = 0
-
-    async def flush_pending(processed_index: int) -> None:
-        nonlocal ingested_docs, pending_count
-        if not pending_documents:
-            return
-        chunk_count = await service.ingest_text_bulk(pending_documents)
-        ingested_docs += pending_count
-        print(
-            f"Processed {processed_index}/{total_docs} documents into Graphiti "
-            f"({ingested_docs} ingested, {skipped_docs} skipped as duplicates, {chunk_count} chunks in batch)"
-        )
-        pending_documents.clear()
-        pending_count = 0
+    batches: list[list[tuple[str, str, str]]] = []
 
     effective_batch_size = max(1, ingest_batch_size)
+    ingest_started_at = time.perf_counter()
 
-    for index, doc_id in enumerate(sorted(corpus), start=1):
+    for doc_id in sorted(corpus):
         document = corpus[doc_id]
         combined_text = combine_document_text(document.get("title", ""), document.get("text", ""))
         content_to_doc_id[combined_text] = doc_id
         if doc_id in known_existing_doc_ids:
-            await flush_pending(index - 1)
             skipped_docs += 1
-            print(
-                f"Processed {index}/{total_docs} documents into Graphiti "
-                f"({ingested_docs} ingested, {skipped_docs} skipped as duplicates)"
-            )
             continue
 
         pending_documents.append((doc_id, combined_text, f"{DOC_PREFIX}{doc_id}"))
-        pending_count += 1
-        if pending_count >= effective_batch_size:
-            await flush_pending(index)
+        if len(pending_documents) >= effective_batch_size:
+            batches.append(pending_documents)
+            pending_documents = []
 
-    await flush_pending(total_docs)
+    if pending_documents:
+        batches.append(pending_documents)
+
+    docs_to_ingest = total_docs - skipped_docs
+    if skipped_docs:
+        print(
+            f"Skipping {skipped_docs}/{total_docs} documents already present in Graphiti before ingest starts"
+        )
+
+    if not batches:
+        print(
+            f"Processed {total_docs}/{total_docs} documents into Graphiti "
+            f"(0 newly ingested, {skipped_docs} skipped as duplicates, 100.0%, avg 0.00 docs/s)"
+        )
+        return content_to_doc_id
+
+    ingested_docs = 0
+    ingested_chunks = 0
+    completed_batches = 0
+    total_batches = len(batches)
+
+    for batch_index, batch_documents in enumerate(batches, start=1):
+        batch_started_at = time.perf_counter()
+        retry_count = 0
+
+        while True:
+            try:
+                chunk_count = await service.ingest_text_bulk(batch_documents)
+                break
+            except RateLimitError:
+                retry_count += 1
+                if retry_count > INGEST_MAX_RATE_LIMIT_RETRIES:
+                    raise
+
+                backoff_seconds = min(
+                    INGEST_RATE_LIMIT_BACKOFF_SECONDS * (2 ** (retry_count - 1)),
+                    120.0,
+                ) + random.uniform(0.0, 1.0)
+                print(
+                    f"Rate limit hit on batch {batch_index}/{total_batches}; retrying in {backoff_seconds:.1f}s "
+                    f"(attempt {retry_count}/{INGEST_MAX_RATE_LIMIT_RETRIES})"
+                )
+                await asyncio.sleep(backoff_seconds)
+
+        batch_elapsed = time.perf_counter() - batch_started_at
+        batch_doc_count = len(batch_documents)
+        ingested_docs += batch_doc_count
+        ingested_chunks += chunk_count
+        completed_batches += 1
+        elapsed = time.perf_counter() - ingest_started_at
+        avg_docs_per_second = ingested_docs / elapsed if elapsed > 0 else 0.0
+        percent_complete = ((ingested_docs + skipped_docs) / total_docs) * 100 if total_docs else 100.0
+        remaining_docs = max(docs_to_ingest - ingested_docs, 0)
+        eta_seconds = (remaining_docs / avg_docs_per_second) if avg_docs_per_second > 0 else 0.0
+        batch_docs_per_second = batch_doc_count / batch_elapsed if batch_elapsed > 0 else 0.0
+        print(
+            f"Processed {ingested_docs + skipped_docs}/{total_docs} documents into Graphiti "
+            f"({percent_complete:.1f}%, {ingested_docs} ingested, {skipped_docs} skipped as duplicates, "
+            f"{ingested_chunks} chunks total, batch {completed_batches}/{total_batches}, "
+            f"batch_id {batch_index}, batch {batch_docs_per_second:.2f} docs/s, "
+            f"avg {avg_docs_per_second:.2f} docs/s, elapsed {format_elapsed(elapsed)}, "
+            f"eta {format_elapsed(eta_seconds)})"
+        )
+
     return content_to_doc_id
 
 
@@ -436,8 +566,11 @@ async def evaluate_graphiti_subset(
     top_k: int,
     search_limit: int,
     ingest_batch_size: int,
+    max_completion_tokens: int,
+    evaluate_existing_only: bool,
+    existing_group_id: str | None,
     reuse_index: bool,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, dict[str, str]], dict[str, str], dict[str, dict[str, int]], dict[str, int] | None]:
     if runtime_dir.exists() and not reuse_index:
         shutil.rmtree(runtime_dir)
     runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -446,6 +579,8 @@ async def evaluate_graphiti_subset(
         runtime_dir=runtime_dir,
         search_limit=search_limit,
         reuse_index=reuse_index,
+        max_completion_tokens=max_completion_tokens,
+        graph_group_id=existing_group_id,
     )
     ingest_marker = runtime_dir / "graphiti_eval_ingested.marker"
     had_existing_index = reuse_index and ingest_marker.exists()
@@ -460,11 +595,36 @@ async def evaluate_graphiti_subset(
         raise RuntimeError(service.startup_error() or "Graphiti evaluation service failed to start.")
 
     try:
+        filtered_corpus = corpus
+        filtered_queries = queries
+        filtered_qrels = qrels
+        existing_filter_stats: dict[str, int] | None = None
         content_to_doc_id: dict[str, str] = {}
-        known_doc_ids = set(corpus)
         existing_doc_ids = await fetch_existing_doc_ids(service)
-        if had_existing_index and known_doc_ids.issubset(existing_doc_ids):
-            for doc_id, document in corpus.items():
+        if evaluate_existing_only:
+            filtered_corpus, filtered_queries, filtered_qrels, existing_filter_stats = filter_dataset_to_existing_docs(
+                corpus=corpus,
+                queries=queries,
+                qrels=qrels,
+                existing_doc_ids=existing_doc_ids,
+            )
+            if not filtered_corpus:
+                raise RuntimeError(
+                    f"No HotpotQA documents from the requested subset exist in Graphiti group '{settings.graph_group_id}'."
+                )
+            print(
+                "Evaluating existing Graphiti ingest only with full positive-doc coverage: "
+                f"group '{settings.graph_group_id}', "
+                f"{existing_filter_stats['existing_doc_count']} documents, "
+                f"{existing_filter_stats['retained_query_count']} queries retained, "
+                f"{existing_filter_stats['partial_query_count']} queries dropped with only partial positive-doc coverage, "
+                f"{existing_filter_stats['dropped_query_count'] - existing_filter_stats['partial_query_count']} queries dropped with no ingested positives"
+            )
+            for doc_id, document in filtered_corpus.items():
+                combined_text = combine_document_text(document.get("title", ""), document.get("text", ""))
+                content_to_doc_id[combined_text] = doc_id
+        elif had_existing_index and set(filtered_corpus).issubset(existing_doc_ids):
+            for doc_id, document in filtered_corpus.items():
                 combined_text = combine_document_text(document.get("title", ""), document.get("text", ""))
                 content_to_doc_id[combined_text] = doc_id
             print(
@@ -479,18 +639,19 @@ async def evaluate_graphiti_subset(
                 )
             content_to_doc_id = await ingest_subset(
                 service=service,
-                corpus=corpus,
+                corpus=filtered_corpus,
                 ingest_batch_size=ingest_batch_size,
                 existing_doc_ids=existing_doc_ids,
             )
             ingest_marker.write_text(settings.graph_group_id, encoding="utf-8")
 
         retrieval_results: dict[str, dict[str, float]] = {}
-        total_queries = len(queries)
-        for index, query_id in enumerate(sorted(queries), start=1):
+        known_doc_ids = set(filtered_corpus)
+        total_queries = len(filtered_queries)
+        for index, query_id in enumerate(sorted(filtered_queries), start=1):
             retrieval_results[query_id] = await rank_documents_for_query(
                 service=service,
-                query_text=queries[query_id],
+                query_text=filtered_queries[query_id],
                 content_to_doc_id=content_to_doc_id,
                 known_doc_ids=known_doc_ids,
                 top_k=top_k,
@@ -500,19 +661,25 @@ async def evaluate_graphiti_subset(
 
         k_values = sorted({1, 3, 5, top_k})
         ndcg, map_scores, recall, precision = EvaluateRetrieval.evaluate(
-            qrels,
+            filtered_qrels,
             retrieval_results,
             k_values,
         )
-        return {
-            "metrics": {
-                "ndcg": ndcg,
-                "map": map_scores,
-                "recall": recall,
-                "precision": precision,
+        return (
+            {
+                "metrics": {
+                    "ndcg": ndcg,
+                    "map": map_scores,
+                    "recall": recall,
+                    "precision": precision,
+                },
+                "rankings": retrieval_results,
             },
-            "rankings": retrieval_results,
-        }
+            filtered_corpus,
+            filtered_queries,
+            filtered_qrels,
+            existing_filter_stats,
+        )
     finally:
         await service.shutdown()
 
@@ -550,6 +717,9 @@ def build_summary(
             "negative_docs": args.negative_docs,
             "top_k": args.top_k,
             "search_limit": args.search_limit,
+            "max_completion_tokens": args.max_completion_tokens,
+            "evaluate_existing_only": args.evaluate_existing_only,
+            "existing_group_id": args.existing_group_id,
             "seed": args.seed,
         },
         "subset": metadata,
@@ -583,7 +753,7 @@ async def async_main(args: argparse.Namespace) -> Path:
         f"({metadata['positive_doc_count']} positive + {metadata['negative_doc_count']} negative)"
     )
 
-    evaluation_result = await evaluate_graphiti_subset(
+    evaluation_result, corpus, queries, qrels, existing_filter_stats = await evaluate_graphiti_subset(
         corpus=corpus,
         queries=queries,
         qrels=qrels,
@@ -591,8 +761,22 @@ async def async_main(args: argparse.Namespace) -> Path:
         top_k=args.top_k,
         search_limit=max(args.search_limit, args.top_k),
         ingest_batch_size=args.ingest_batch_size,
+        max_completion_tokens=args.max_completion_tokens,
+        evaluate_existing_only=args.evaluate_existing_only,
+        existing_group_id=args.existing_group_id,
         reuse_index=args.reuse_index,
     )
+    if existing_filter_stats is not None:
+        metadata = {
+            **metadata,
+            "subset_doc_count": existing_filter_stats["existing_doc_count"],
+            "query_count": existing_filter_stats["retained_query_count"],
+            "negative_doc_count": 0,
+            "existing_only": True,
+            "full_positive_doc_coverage_required": True,
+            "partial_query_count": existing_filter_stats["partial_query_count"],
+            "dropped_query_count": existing_filter_stats["dropped_query_count"],
+        }
     summary = build_summary(
         args=args,
         metadata=metadata,
